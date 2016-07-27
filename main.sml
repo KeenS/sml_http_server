@@ -1,10 +1,8 @@
 structure Format = Ponyo_Format
-
 structure Request  = Ponyo_Net_Http_Request
 structure Response = Ponyo_Net_Http_Response
 
 val MAX_CONN : int ref = ref ~1
-
 
 structure WritePool = struct
 open Socket
@@ -18,7 +16,7 @@ fun empty (): 'af t = []
 fun isEmpty (t:'af t) = List.null t
 (* TODO: get from other place *)
 fun handler conn =  let
-    val request = Request.read (conn);
+    val request = Request.read conn
     val response = Response.new "ok"
 in
     Format.println [Request.marshall request];
@@ -26,11 +24,12 @@ in
 end
 
 fun add (t:'af t) (desc, sock): 'af t = (desc, sock) :: t
-fun read (t:'af t) socks: {complete: 'af WritePool.t, incomplete: 'af t} = let
+
+fun read (t:'af t) socks: ('af WritePool.t * 'af t) = let
     val (ready, incompletes) = List.partition (fn x => (List.exists (fn desc => sameDesc(desc, #1 x)) socks)) t
     val completes =  List.map (fn (desc, conn) => (desc, conn, handler conn)) ready
 in
-    {complete = completes, incomplete = incompletes}
+    (completes, incompletes)
 end
 end
 
@@ -42,30 +41,34 @@ fun empty (): 'af t = []
 fun isEmpty (t:'af t) = List.null t
 fun add (t:'af t) (desc, sock, res): 'af t = (desc, sock, res) :: t
 
-fun write (t:'af t) socks : 'af t = let
-    fun f (desc, conn, res) =
-      if List.exists (fn x => sameDesc(desc, x)) socks
-      then (
-          Response.write(conn, res)
-        ; Socket.close conn
-        ; false)
-      else true
+fun write (t:'af t) socks : ('af t * 'af ReadPool.t) = let
+    val (ready, incompletes) = List.partition (fn x => (List.exists (fn desc => sameDesc(desc, #1 x)) socks)) t
+
+    fun f (desc, conn, res) = let
+        val () = Response.write(conn, res)
+    in
+        Socket.close conn;
+        false
+    end
+
+    val toRead =  List.filter f ready
 in
-    List.filter f t
+    (incompletes, List.map (fn (desc, conn, res) => (desc, conn)) toRead)
 end
 
 end
 
 structure ConnPool = struct
 type 'af t = 'af ReadPool.t * 'af WritePool.t
+val timeout = SOME(Time.fromSeconds(LargeInt.fromInt 0))
 fun empty (): 'af t = (ReadPool.empty(), WritePool.empty())
 fun isEmpty ((r, w):'af t) = ReadPool.isEmpty r andalso WritePool.isEmpty w
 fun add ((r, w):'af t) conn = (ReadPool.add r (Socket.sockDesc conn, conn), w)
-fun process ((r, w):'af t) (rds, wrs) = let
-    val {complete=rcmp, incomplete=ricmp} = ReadPool.read r rds
-    val wicmp = WritePool.write (w @ rcmp) (wrs)
+fun process ((r, w):'af t) {rds = rds, wrs = wrs, exs = exs} = let
+    val (rcmp, ricmp) = ReadPool.read r rds
+    val (wicmp, rready) = WritePool.write (w) (wrs)
 in
-    (ricmp, wicmp)
+    (ricmp @ rready, wicmp @ rcmp)
 end
 fun toSelect (t: 'af t) (time: Time.time option) = {
     rds = List.map #1 (#1 t),
@@ -73,6 +76,8 @@ fun toSelect (t: 'af t) (time: Time.time option) = {
     exs = [],
     timeout = time
 }
+
+fun handleConns (t: 'af t): 'af t = process t (Socket.select (toSelect t timeout))
 
 end
 
@@ -83,10 +88,9 @@ fun serve (sock, pool) : unit =
                  else case Socket.acceptNB sock of
                           SOME((conn, _)) => ConnPool.add pool conn
                         | NONE => pool
-      val readys = Socket.select (ConnPool.toSelect pool (SOME(Time.fromSeconds(LargeInt.fromInt 0))))
-      val pool = ConnPool.process pool (#rds readys, #wrs readys)
+
   in
-      serve (sock, pool);
+      serve (sock, ConnPool.handleConns pool);
       ()
   end
 
